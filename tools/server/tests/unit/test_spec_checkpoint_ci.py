@@ -39,9 +39,15 @@ def test_spec_decoding_with_checkpoint_flags():
     ]
     server.start()
 
+    # discover model name (required by server's model router)
+    models_res = server.make_request("GET", "/v1/models")
+    assert models_res.status_code == 200, f"Failed to list models: {models_res.status_code}"
+    model_name = models_res.body["data"][0]["id"]
+
     outputs = []
     for i in range(10):
         res = server.make_request("POST", "/completion", data={
+            "model": model_name,
             "prompt": "Once upon a time there was a little girl",
             "temperature": 0.0,
             "top_k": 1,

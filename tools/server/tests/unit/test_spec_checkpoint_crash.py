@@ -16,6 +16,14 @@ import requests as req_lib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from utils import ServerProcess
 
+
+def _get_model_name(server):
+    """Query /v1/models to discover the server's model name."""
+    base_url = f"http://{server.server_host}:{server.server_port}"
+    resp = req_lib.get(f"{base_url}/v1/models", timeout=10)
+    assert resp.status_code == 200, f"Failed to list models: {resp.status_code}"
+    return resp.json()["data"][0]["id"]
+
 QWEN35_9B = os.environ.get(
     "QWEN35_9B_MODEL",
     os.path.expanduser("~/Models/Qwen3.5-9B-Q4_K_M.gguf"),
@@ -37,13 +45,13 @@ def do_something():
     pass
 
 
-def _make_chat_request(base_url, messages, max_tokens=400):
+def _make_chat_request(base_url, messages, model_name, max_tokens=400):
     """Make a chat request, returning (status, body) or (None, error_str)."""
     try:
         resp = req_lib.post(
             f"{base_url}/v1/chat/completions",
             json={
-                "model": "test",
+                "model": model_name,
                 "messages": messages,
                 "max_tokens": max_tokens,
                 "temperature": 0,
@@ -84,12 +92,14 @@ def test_server_survives_kv_exhaustion_with_ngram():
     server.fa = None
     server.start(timeout_seconds=120)
     base_url = f"http://{server.server_host}:{server.server_port}"
+    model_name = _get_model_name(server)
 
     # phase 1: build ngram data
     for i in range(3):
         _make_chat_request(
             base_url,
             [{"role": "user", "content": f"Write quicksort in Python variant {i}. Full code."}],
+            model_name,
             max_tokens=500,
         )
         if server.process.poll() is not None:
@@ -108,6 +118,7 @@ def test_server_survives_kv_exhaustion_with_ngram():
                         {"role": "assistant", "content": "def quicksort(a,l=0,h=None):\n    if h is None: h=len(a)-1\n    if l<h: p=partition(a,l,h); quicksort(a,l,p-1); quicksort(a,p+1,h)"},
                         {"role": "user", "content": "Add mergesort heapsort bubblesort insertion selection. Full implementations."},
                     ],
+                    model_name,
                     max_tokens=1500,
                 ))
             _ = [f.result() for f in as_completed(futures)]
@@ -144,12 +155,14 @@ def test_server_survives_kv_exhaustion_with_draft_model():
     server.fa = None
     server.start(timeout_seconds=120)
     base_url = f"http://{server.server_host}:{server.server_port}"
+    model_name = _get_model_name(server)
 
     # build ngram data
     for i in range(3):
         _make_chat_request(
             base_url,
             [{"role": "user", "content": f"Write quicksort in Python variant {i}. Full code."}],
+            model_name,
             max_tokens=500,
         )
         if server.process.poll() is not None:
@@ -168,6 +181,7 @@ def test_server_survives_kv_exhaustion_with_draft_model():
                         {"role": "assistant", "content": "def quicksort(a,l=0,h=None):\n    if h is None: h=len(a)-1"},
                         {"role": "user", "content": "Add mergesort heapsort bubblesort insertion selection. Full implementations."},
                     ],
+                    model_name,
                     max_tokens=1500,
                 ))
             _ = [f.result() for f in as_completed(futures)]

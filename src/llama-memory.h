@@ -117,6 +117,18 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+
+    //
+    // GPU-resident checkpoint for speculative decoding (optional, default no-op)
+    //
+
+    virtual bool checkpoint_save(llama_seq_id /*seq_id*/) { return false; }
+
+    virtual bool checkpoint_restore(llama_seq_id /*seq_id*/) { return false; }
+
+    virtual void checkpoint_delete() {}
+
+    virtual bool checkpoint_supported() const { return false; }
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

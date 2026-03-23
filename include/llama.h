@@ -763,6 +763,16 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // GPU-resident checkpoint for speculative decoding (fast save/restore)
+    // Returns false if the memory implementation does not support GPU checkpoints
+    LLAMA_API bool llama_memory_checkpoint_save(llama_memory_t mem, llama_seq_id seq_id);
+
+    LLAMA_API bool llama_memory_checkpoint_restore(llama_memory_t mem, llama_seq_id seq_id);
+
+    LLAMA_API void llama_memory_checkpoint_delete(llama_memory_t mem);
+
+    LLAMA_API bool llama_memory_checkpoint_supported(llama_memory_t mem);
+
     //
     // State / sessions
     //

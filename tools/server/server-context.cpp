@@ -171,6 +171,14 @@ struct server_slot {
     int32_t n_spec_empty  = 0;  // compute_draft returned empty (no prediction)
     int32_t n_spec_skip   = 0;  // sample_and_accept returned skip (full rejection)
 
+    // checkpoint timing instrumentation
+    int64_t t_checkpoint_save_us    = 0;  // cumulative time in checkpoint save
+    int64_t t_checkpoint_restore_us = 0;  // cumulative time in checkpoint restore
+    int64_t t_memory_seq_rm_us      = 0;  // cumulative time in memory_seq_rm
+    int32_t n_checkpoint_save       = 0;  // number of checkpoint saves
+    int32_t n_checkpoint_restore    = 0;  // number of checkpoint restores
+    int32_t n_memory_seq_rm         = 0;  // number of memory_seq_rm calls
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -199,6 +207,13 @@ struct server_slot {
         n_spec_cycles    = 0;
         n_spec_empty     = 0;
         n_spec_skip      = 0;
+
+        t_checkpoint_save_us    = 0;
+        t_checkpoint_restore_us = 0;
+        t_memory_seq_rm_us      = 0;
+        n_checkpoint_save       = 0;
+        n_checkpoint_restore    = 0;
+        n_memory_seq_rm         = 0;
 
         task_prev = std::move(task);
         task.reset();
@@ -414,6 +429,22 @@ struct server_slot {
                     "spec cycles = %5d (empty = %5d, skip = %5d, accept = %5d)\n",
                     draft_ratio, n_draft_accepted, n_draft_total, n_spec_cycles, n_spec_empty, n_spec_skip,
                     n_spec_cycles - n_spec_empty - n_spec_skip);
+        }
+
+        if (n_checkpoint_save > 0) {
+            const double t_ckpt_total = (t_checkpoint_save_us + t_checkpoint_restore_us + t_memory_seq_rm_us) / 1000.0;
+            SLT_CNT(*this,
+                    "checkpoint timing: save %.1f ms (%d calls, avg %.3f ms), "
+                    "restore %.1f ms (%d calls, avg %.3f ms), "
+                    "seq_rm %.1f ms (%d calls, avg %.3f ms), "
+                    "total %.1f ms (%.1f%% of generation time %.1f ms)\n",
+                    t_checkpoint_save_us / 1000.0, n_checkpoint_save,
+                    n_checkpoint_save > 0 ? (t_checkpoint_save_us / 1000.0 / n_checkpoint_save) : 0.0,
+                    t_checkpoint_restore_us / 1000.0, n_checkpoint_restore,
+                    n_checkpoint_restore > 0 ? (t_checkpoint_restore_us / 1000.0 / n_checkpoint_restore) : 0.0,
+                    t_memory_seq_rm_us / 1000.0, n_memory_seq_rm,
+                    n_memory_seq_rm > 0 ? (t_memory_seq_rm_us / 1000.0 / n_memory_seq_rm) : 0.0, t_ckpt_total,
+                    t_token_generation > 0 ? (t_ckpt_total / t_token_generation * 100.0) : 0.0, t_token_generation);
         }
 
         if (spec_session) {
@@ -677,23 +708,67 @@ private:
         }
 
         bool memory_seq_rm(llama_pos p0, llama_pos p1) override {
-            return llama_memory_seq_rm(llama_get_memory(ctx_impl.ctx), slot_id, p0, p1);
+            server_slot * slot    = get_slot();
+            const int64_t t_start = ggml_time_us();
+
+            bool result = llama_memory_seq_rm(llama_get_memory(ctx_impl.ctx), slot_id, p0, p1);
+
+            const int64_t t_elapsed = ggml_time_us() - t_start;
+            slot->t_memory_seq_rm_us += t_elapsed;
+            slot->n_memory_seq_rm++;
+
+            return result;
         }
 
         size_t create_checkpoint() override {
             server_slot * slot = get_slot();
+            const int64_t t_start = ggml_time_us();
+
             const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_impl.ctx), slot_id);
             const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_impl.ctx), slot_id);
-            const auto n_tokens_cur = 0; // TODO was ctx_impl.batch.n_tokens; The draft model doesn't change the prompt?
+
+            // Try GPU-to-GPU checkpoint first (fast path)
+            llama_memory_t mem = llama_get_memory(ctx_impl.ctx);
+            if (llama_memory_checkpoint_save(mem, slot_id)) {
+                // GPU path only maintains one checkpoint — clear any previous entries
+                slot->prompt.checkpoints.clear();
+
+                auto & cur = slot->prompt.checkpoints.emplace_back(server_prompt_checkpoint{
+                    /*.pos_min       = */ pos_min,
+                    /*.pos_max       = */ pos_max,
+                    /*.n_tokens      = */ slot->prompt.n_tokens(),
+                    /*.data          = */ {},
+                    /*.gpu_checkpoint = */ true,
+                });
+
+                slot->smpl_checkpoint.reset(common_sampler_clone(slot->smpl.get()));
+
+                const int64_t t_elapsed = ggml_time_us() - t_start;
+                slot->t_checkpoint_save_us += t_elapsed;
+                slot->n_checkpoint_save++;
+
+                SLT_INF(*slot, "created GPU checkpoint %zu (pos_min=%d, pos_max=%d, took %.3f ms)\n",
+                        slot->prompt.checkpoints.size(), cur.pos_min, cur.pos_max, t_elapsed / 1000.0);
+
+                return 1;
+            }
+
+            // Fall back to serialization path
+            const auto   n_tokens_cur  = 0;
             const auto & cur_with_size = ctx_impl.get_checkpoint(*slot, n_tokens_cur, pos_min, pos_max);
             auto & cur = cur_with_size.checkpoint;
 
-            // save sampler state alongside KV checkpoint
             slot->smpl_checkpoint.reset(common_sampler_clone(slot->smpl.get()));
 
-            SLT_DBG(*slot, "created context checkpoint %zu of %d (pos_min = %d, pos_max = %d, size = %.3f MiB)\n",
-                    slot->prompt.checkpoints.size(), ctx_impl.params_base.n_ctx_checkpoints,
-                    cur.pos_min, cur.pos_max, (float) cur.data.size() / 1024 / 1024);
+            const int64_t t_elapsed = ggml_time_us() - t_start;
+            slot->t_checkpoint_save_us += t_elapsed;
+            slot->n_checkpoint_save++;
+
+            SLT_INF(
+                *slot,
+                "created context checkpoint %zu of %d (pos_min = %d, pos_max = %d, size = %.3f MiB, took %.3f ms)\n",
+                slot->prompt.checkpoints.size(), ctx_impl.params_base.n_ctx_checkpoints, cur.pos_min, cur.pos_max,
+                (float) cur.data.size() / 1024 / 1024, t_elapsed / 1000.0);
             return cur_with_size.size;
         }
 
@@ -701,26 +776,53 @@ private:
             server_slot * slot = get_slot();
             auto & ckpt = slot->prompt.checkpoints.back();
 
-            SLT_DBG(*slot, "restoring checkpoint (pos_min = %d, pos_max = %d)\n", ckpt.pos_min, ckpt.pos_max);
-            const size_t n = llama_state_seq_set_data_ext(ctx_impl.ctx,
-                    ckpt.data.data(), ckpt.size(), slot_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-            if (n != ckpt_size_part_expected) {
-                GGML_ABORT("%s: failed to restore context checkpoint (pos_min=%d, pos_max=%d, size=%zu, get_data_ext->%zu, set_data_ext->%zu",
-                            __func__, ckpt.pos_min, ckpt.pos_max, ckpt.size(), ckpt_size_part_expected, n);
+            SLT_INF(*slot, "restoring checkpoint (pos_min=%d, pos_max=%d, gpu=%s)\n", ckpt.pos_min, ckpt.pos_max,
+                    ckpt.gpu_checkpoint ? "true" : "false");
+            const int64_t t_start = ggml_time_us();
+
+            if (ckpt.gpu_checkpoint) {
+                // GPU restore path
+                llama_memory_t mem = llama_get_memory(ctx_impl.ctx);
+                if (!llama_memory_checkpoint_restore(mem, slot_id)) {
+                    GGML_ABORT("%s: GPU checkpoint restore failed\n", __func__);
+                }
+            } else {
+                // Serialization restore path (fallback)
+                const size_t n = llama_state_seq_set_data_ext(ctx_impl.ctx, ckpt.data.data(), ckpt.size(), slot_id,
+                                                              LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                if (n != ckpt_size_part_expected) {
+                    GGML_ABORT(
+                        "%s: failed to restore context checkpoint (pos_min=%d, pos_max=%d, size=%zu, "
+                        "get_data_ext->%zu, "
+                        "set_data_ext->%zu",
+                        __func__, ckpt.pos_min, ckpt.pos_max, ckpt.size(), ckpt_size_part_expected, n);
+                }
             }
 
             slot->prompt.tokens.keep_first(ckpt.pos_max + 1);
 
-            // restore sampler state from checkpoint
             if (slot->smpl_checkpoint) {
                 slot->smpl.reset(common_sampler_clone(slot->smpl_checkpoint.get()));
             }
 
-            return { n, ckpt.pos_max };
+            const int64_t t_elapsed = ggml_time_us() - t_start;
+            slot->t_checkpoint_restore_us += t_elapsed;
+            slot->n_checkpoint_restore++;
+
+            SLT_INF(*slot, "restored checkpoint (took %.3f ms)\n", t_elapsed / 1000.0);
+
+            return { ckpt.gpu_checkpoint ? size_t(1) : ckpt.size(), ckpt.pos_max };
         }
 
         void delete_checkpoint() override {
             server_slot * slot = get_slot();
+
+            auto & ckpt = slot->prompt.checkpoints.back();
+            if (ckpt.gpu_checkpoint) {
+                llama_memory_t mem = llama_get_memory(ctx_impl.ctx);
+                llama_memory_checkpoint_delete(mem);
+            }
+
             slot->prompt.checkpoints.pop_back();
             slot->smpl_checkpoint.reset();
         }

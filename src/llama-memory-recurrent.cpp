@@ -121,6 +121,152 @@ llama_memory_recurrent::llama_memory_recurrent(
     }
 }
 
+bool llama_memory_recurrent::checkpoint_alloc_shadows() {
+    if (ckpt.allocated) {
+        return true;
+    }
+
+    const int32_t n_layer = hparams.n_layer;
+
+    ckpt.r_l_shadow.resize(n_layer, nullptr);
+    ckpt.s_l_shadow.resize(n_layer, nullptr);
+
+    // Mirror the primary tensor allocation pattern:
+    // group tensors by buffer type, one ggml_context per buffer type
+    struct ggml_backend_buft_comparator {
+        bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
+            return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
+        }
+    };
+
+    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+
+    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+        auto it = ctx_map.find(buft);
+        if (it == ctx_map.end()) {
+            ggml_init_params params = {
+                /*.mem_size   =*/size_t(2u * n_layer * ggml_tensor_overhead()),
+                /*.mem_buffer =*/NULL,
+                /*.no_alloc   =*/true,
+            };
+            ggml_context * ctx = ggml_init(params);
+            if (!ctx) {
+                return nullptr;
+            }
+            ctx_map.emplace(buft, ctx);
+            return ctx;
+        }
+        return it->second.get();
+    };
+
+    for (int i = 0; i < n_layer; i++) {
+        if (r_l[i] == nullptr) {
+            continue;
+        }
+
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(r_l[i]->buffer);
+
+        ggml_context * ctx = ctx_for_buft(buft);
+        if (!ctx) {
+            LLAMA_LOG_ERROR("%s: failed to create ggml context for shadow tensors\n", __func__);
+            return false;
+        }
+
+        ggml_tensor * r_shadow = ggml_dup_tensor(ctx, r_l[i]);
+        ggml_tensor * s_shadow = ggml_dup_tensor(ctx, s_l[i]);
+        ggml_format_name(r_shadow, "cache_r_l%d_shadow", i);
+        ggml_format_name(s_shadow, "cache_s_l%d_shadow", i);
+
+        ckpt.r_l_shadow[i] = r_shadow;
+        ckpt.s_l_shadow[i] = s_shadow;
+    }
+
+    // Allocate buffers (same pattern as constructor)
+    for (auto & [buft, ctx] : ctx_map) {
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        if (!buf) {
+            LLAMA_LOG_ERROR("%s: failed to allocate buffer for shadow tensors\n", __func__);
+            return false;
+        }
+        ggml_backend_buffer_clear(buf, 0);
+        LLAMA_LOG_INFO("%s: %10s shadow buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf),
+                       ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0);
+        ckpt.shadow_bufs.emplace_back(std::move(ctx), buf);
+    }
+
+    ckpt.allocated = true;
+    return true;
+}
+
+bool llama_memory_recurrent::checkpoint_supported() const {
+    for (const auto * r : r_l) {
+        if (r != nullptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool llama_memory_recurrent::checkpoint_save(llama_seq_id seq_id) {
+    GGML_UNUSED(seq_id);  // single-checkpoint, full-tensor copy — seq_id for future use
+
+    if (!checkpoint_alloc_shadows()) {
+        return false;
+    }
+
+    const int32_t n_layer = hparams.n_layer;
+
+    // 1. Snapshot cell metadata (small, host-side, fast)
+    ckpt.cells_snapshot = cells;
+    ckpt.head_snapshot  = head;
+    ckpt.used_snapshot  = used;
+    ckpt.rs_z_snapshot  = rs_z;
+
+    // 2. Copy tensors: primary → shadow (GPU-to-GPU when on same device)
+    for (int il = 0; il < n_layer; ++il) {
+        if (r_l[il] == nullptr) {
+            continue;
+        }
+        ggml_backend_tensor_copy(r_l[il], ckpt.r_l_shadow[il]);
+        ggml_backend_tensor_copy(s_l[il], ckpt.s_l_shadow[il]);
+    }
+
+    ckpt.saved = true;
+    return true;
+}
+
+bool llama_memory_recurrent::checkpoint_restore(llama_seq_id seq_id) {
+    GGML_UNUSED(seq_id);  // single-checkpoint, full-tensor copy
+
+    if (!ckpt.saved) {
+        LLAMA_LOG_ERROR("%s: no checkpoint saved\n", __func__);
+        return false;
+    }
+
+    const int32_t n_layer = hparams.n_layer;
+
+    // 1. Restore cell metadata
+    cells = ckpt.cells_snapshot;
+    head  = ckpt.head_snapshot;
+    used  = ckpt.used_snapshot;
+    rs_z  = ckpt.rs_z_snapshot;
+
+    // 2. Copy tensors: shadow → primary (GPU-to-GPU)
+    for (int il = 0; il < n_layer; ++il) {
+        if (r_l[il] == nullptr) {
+            continue;
+        }
+        ggml_backend_tensor_copy(ckpt.r_l_shadow[il], r_l[il]);
+        ggml_backend_tensor_copy(ckpt.s_l_shadow[il], s_l[il]);
+    }
+
+    return true;
+}
+
+void llama_memory_recurrent::checkpoint_delete() {
+    ckpt.saved = false;
+}
+
 void llama_memory_recurrent::clear(bool data) {
     for (int32_t i = 0; i < (int32_t) size; ++i) {
         cells[i].pos = -1;
