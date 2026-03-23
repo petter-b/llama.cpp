@@ -1,0 +1,9 @@
+workload	config	label	tokens	tps	draft_n	draft_accepted	accept_pct
+W1	baseline	turn1	866	233.461818209267			
+W1	baseline	turn2	864	229.56426364605443			
+W1	baseline	turn3	1134	225.7756558494112			
+W1	baseline	turn4	966	224.29047241470982			
+W1	ngram	turn1	866	123.20874264197673	0	0	
+W1	ngram	turn2	864	66.58556688477807	192	192	100
+W1	ngram	turn3	4096	98.5826529381337	2	2	100
+W1	ngram	turn4	4096	30.24366350947235	202	202	100

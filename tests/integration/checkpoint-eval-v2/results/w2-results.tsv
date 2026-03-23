@@ -1,0 +1,11 @@
+workload	config	label	tokens	tps	draft_n	draft_accepted	accept_pct
+W2	baseline	run1	1602	36.943992906753365			
+W2	baseline	run2	1554	36.754429653795505			
+W2	baseline	run3	1535	36.425992658133545			
+W2	baseline	run4	1535	36.30178337063312			
+W2	baseline	run5	1602	36.25073123744066			
+W2	ngram	run1	1557	31.718818318581164			
+W2	ngram	run2	1597	17.53175368902623			
+W2	ngram	run3	1542	13.523229053129901			
+W2	ngram	run4	1543	8.252996015396826			
+W2	ngram	run5	1534	11.992215285499624			
