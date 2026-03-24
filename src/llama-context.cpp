@@ -3292,6 +3292,22 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     return mem->get_can_shift();
 }
 
+bool llama_memory_checkpoint_save(llama_memory_t mem, llama_seq_id seq_id) {
+    return mem->checkpoint_save(seq_id);
+}
+
+bool llama_memory_checkpoint_restore(llama_memory_t mem, llama_seq_id seq_id) {
+    return mem->checkpoint_restore(seq_id);
+}
+
+void llama_memory_checkpoint_delete(llama_memory_t mem) {
+    mem->checkpoint_delete();
+}
+
+bool llama_memory_checkpoint_supported(llama_memory_t mem) {
+    return mem->checkpoint_supported();
+}
+
 // llama state API
 
 // deprecated

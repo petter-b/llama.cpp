@@ -16,6 +16,13 @@ import os
 import pytest
 from utils import ServerProcess
 
+
+def _get_model_name(server):
+    """Query /v1/models to discover the server's model name."""
+    res = server.make_request("GET", "/v1/models")
+    assert res.status_code == 200, f"Failed to list models: {res.status_code}"
+    return res.body["data"][0]["id"]
+
 QWEN35_08B = os.environ.get(
     "QWEN35_08B_MODEL",
     os.path.expanduser("~/Models/Qwen3.5-0.8B-BF16.gguf"),
@@ -75,12 +82,14 @@ def test_kv_cache_does_not_leak_across_requests():
     """
     server = _create_checkpoint_server(n_ctx=512)
     server.start(timeout_seconds=120)
+    model_name = _get_model_name(server)
 
     n_requests = 20
     n_predict = 128
 
     for i in range(n_requests):
         res = server.make_request("POST", "/completion", data={
+            "model": model_name,
             "prompt": f"Write a sorting algorithm number {i} in Python.",
             "temperature": 0.0,
             "top_k": 1,
@@ -127,9 +136,11 @@ def test_f16_checkpoint_determinism():
         "--no-cache-prompt",
     ]
     server.start(timeout_seconds=120)
+    model_name = _get_model_name(server)
 
     # prime ngram model so all test requests use the same speculative path
     server.make_request("POST", "/completion", data={
+        "model": model_name,
         "prompt": "Write a quicksort implementation in C. Output only code.",
         "temperature": 0.0, "top_k": 1, "n_predict": 256,
     })
@@ -137,6 +148,7 @@ def test_f16_checkpoint_determinism():
     outputs = []
     for i in range(10):
         res = server.make_request("POST", "/completion", data={
+            "model": model_name,
             "prompt": "Write a quicksort implementation in C. Output only code.",
             "temperature": 0.0,
             "top_k": 1,

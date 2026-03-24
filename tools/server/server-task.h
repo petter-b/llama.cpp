@@ -572,6 +572,8 @@ struct server_prompt_checkpoint {
 
     std::vector<uint8_t> data;
 
+    bool gpu_checkpoint = false;  // true when data lives on GPU (shadow tensors)
+
     size_t size() const {
         return data.size();
     }

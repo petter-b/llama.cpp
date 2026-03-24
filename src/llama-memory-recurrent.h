@@ -65,6 +65,12 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
+    // GPU-to-GPU checkpoint: fast save/restore for speculative decoding
+    bool checkpoint_save(llama_seq_id seq_id) override;
+    bool checkpoint_restore(llama_seq_id seq_id) override;
+    void checkpoint_delete() override;
+    bool checkpoint_supported() const override;
+
     uint32_t head = 0; // the location where the batch will be placed in the cache (see find_slot())
     uint32_t size = 0; // total number of cells, shared across all sequences
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
@@ -111,6 +117,29 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+
+    // GPU-resident checkpoint: shadow tensors + cell metadata snapshot
+    struct gpu_checkpoint {
+        // cell metadata snapshot (small, host-side)
+        std::vector<mem_cell> cells_snapshot;
+        uint32_t              head_snapshot = 0;
+        uint32_t              used_snapshot = 0;
+        int32_t               rs_z_snapshot = -1;
+
+        // shadow tensors (same device as primaries)
+        std::vector<ggml_tensor *> r_l_shadow;
+        std::vector<ggml_tensor *> s_l_shadow;
+
+        // ggml contexts + buffers for shadow tensors
+        std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> shadow_bufs;
+
+        bool allocated = false;
+        bool saved     = false;  // true after a successful save
+    };
+
+    gpu_checkpoint ckpt;
+
+    bool checkpoint_alloc_shadows();
 
     size_t total_size() const;
 

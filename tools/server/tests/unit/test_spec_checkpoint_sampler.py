@@ -14,6 +14,13 @@ import os
 import pytest
 from utils import ServerProcess
 
+
+def _get_model_name(server):
+    """Query /v1/models to discover the server's model name."""
+    res = server.make_request("GET", "/v1/models")
+    assert res.status_code == 200, f"Failed to list models: {res.status_code}"
+    return res.body["data"][0]["id"]
+
 QWEN35_08B = os.environ.get(
     "QWEN35_08B_MODEL",
     os.path.expanduser("~/Models/Qwen3.5-0.8B-BF16.gguf"),
@@ -38,10 +45,11 @@ WARMUP_PROMPTS = [
 ]
 
 
-def _warmup_ngram(server, n_predict=128):
+def _warmup_ngram(server, model_name, n_predict=128):
     """Send diverse prompts to build ngram data for speculative drafting."""
     for prompt in WARMUP_PROMPTS:
         server.make_request("POST", "/completion", data={
+            "model": model_name,
             "prompt": prompt,
             "temperature": 0.0, "top_k": 1, "n_predict": n_predict,
         })
@@ -80,9 +88,10 @@ def test_grammar_output_valid_after_checkpoint_restore():
         "--no-cache-prompt",
     ]
     server.start(timeout_seconds=120)
+    model_name = _get_model_name(server)
 
     # prime ngram model so drafts are generated and rejected
-    _warmup_ngram(server)
+    _warmup_ngram(server, model_name)
 
     json_schema = {
         "type": "object",
@@ -98,6 +107,7 @@ def test_grammar_output_valid_after_checkpoint_restore():
     }
 
     res = server.make_request("POST", "/completion", data={
+        "model": model_name,
         "prompt": (
             "Generate a JSON object describing a person named Alice "
             "who is 30 years old and likes reading and hiking."
@@ -145,13 +155,6 @@ def test_repetition_penalty_determinism_with_checkpoints():
     )
 
     prompt = "List 10 different animals. One per line. No numbering."
-    request_data = {
-        "prompt": prompt,
-        "temperature": 0.0,
-        "top_k": 1,
-        "n_predict": 256,
-        "repeat_penalty": 1.3,
-    }
 
     # baseline: no checkpoints
     server_base = ServerProcess()
@@ -163,7 +166,18 @@ def test_repetition_penalty_determinism_with_checkpoints():
         "--no-cache-prompt",
     ]
     server_base.start(timeout_seconds=120)
-    _warmup_ngram(server_base)
+    model_name_base = _get_model_name(server_base)
+
+    request_data = {
+        "model": model_name_base,
+        "prompt": prompt,
+        "temperature": 0.0,
+        "top_k": 1,
+        "n_predict": 256,
+        "repeat_penalty": 1.3,
+    }
+
+    _warmup_ngram(server_base, model_name_base)
     res_base = server_base.make_request("POST", "/completion", data=request_data)
     assert res_base.status_code == 200
     output_base = res_base.body["content"]
@@ -181,7 +195,9 @@ def test_repetition_penalty_determinism_with_checkpoints():
         "--no-cache-prompt",
     ]
     server_ckpt.start(timeout_seconds=120)
-    _warmup_ngram(server_ckpt)
+    model_name_ckpt = _get_model_name(server_ckpt)
+    request_data["model"] = model_name_ckpt
+    _warmup_ngram(server_ckpt, model_name_ckpt)
     res_ckpt = server_ckpt.make_request("POST", "/completion", data=request_data)
     assert res_ckpt.status_code == 200
     output_ckpt = res_ckpt.body["content"]
@@ -201,7 +217,7 @@ def test_warning_quantized_v_cache_with_checkpoints():
     import time
 
     server_path = os.environ.get(
-        "LLAMA_SERVER_BIN_PATH", "../../../../build-metal/bin/llama-server"
+        "LLAMA_SERVER_BIN_PATH", "../../../build/bin/llama-server"
     )
 
     log_fd = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.log')
